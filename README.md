@@ -1,3 +1,5 @@
+![Screenshot](./assets/screenshot.png)
+
 # dap-observer
 
 A read-only, late-joining DAP client that rides a DAP multiplexer session
