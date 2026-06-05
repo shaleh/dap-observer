@@ -9,13 +9,13 @@ use std::pin::Pin;
 use anyhow::Result;
 use serde_json::json;
 
-use crate::dap::types::{ScopesBody, StackTraceBody, StoppedBody, VariablesBody};
-use crate::dap::{ConnEvent, DapClient, initialize_args};
-use crate::model::is_noise;
+use crate::dap::types::{ScopesBody, StoppedBody};
+use crate::dap::{ConnEvent, DapClient, initialize};
+use crate::model::{any_locals_scope, fetch_children, resolve_top_frame, scope_opens_by_default};
 
 const MAX_DEPTH: usize = 2; // how deep to expand containers in the printout
 const MAX_CHILDREN: usize = 40; // cap children shown per node
-const SHOW_GLOBALS: bool = false; // Globals is huge/noisy. Locals only by default
+const SHOW_ALL_SCOPES: bool = false; // non-locals scopes are huge/noisy. Locals only by default
 
 /// Run the headless observer loop until the session ends, the connection drops,
 /// or the user hits Ctrl-C. Returns the process exit code.
@@ -28,9 +28,7 @@ pub async fn run(
 
     // Minimal late-join handshake. The mux replies with cached capabilities and
     // replays the current stopped state.
-    client
-        .request("initialize", Some(initialize_args()))
-        .await?;
+    initialize(&client).await?;
     println!("initialized — waiting for the program to stop (breakpoint or step)…");
     println!("(Ctrl-C to stop observing)");
 
@@ -73,28 +71,15 @@ pub async fn run(
         }
     }
 
-    client.disconnect();
+    client.disconnect().await;
     Ok(exit_code)
 }
 
 async fn handle_stop(client: &DapClient, body: StoppedBody, stop_number: u64) {
-    let thread_id = body.thread_id.unwrap_or(0);
-    let _ = client.request("threads", Some(json!({}))).await;
-
-    let Ok(stack_trace) = client
-        .request(
-            "stackTrace",
-            Some(json!({ "threadId": thread_id, "levels": 1 })),
-        )
-        .await
-    else {
-        return;
-    };
-    let frames = stack_trace
-        .parse_body::<StackTraceBody>()
-        .unwrap_or_default()
-        .stack_frames;
-    let Some(top) = frames.into_iter().next() else {
+    // Resolve the stopped thread (preferring the stop event's thread id, else
+    // the first reported thread) and its top frame. A transport error or a
+    // frameless stop is treated as idle.
+    let Ok(Some(top)) = resolve_top_frame(client, body.thread_id).await else {
         return;
     };
 
@@ -106,19 +91,22 @@ async fn handle_stop(client: &DapClient, body: StoppedBody, stop_number: u64) {
     );
     println!("{bar}");
 
+    // A stale frame (an `Ok` response with `success == false`) and a transport
+    // error both leave us nothing to print; only a successful reply carries
+    // scopes.
     let scopes = match client
         .request("scopes", Some(json!({ "frameId": top.id })))
         .await
     {
-        Ok(resp) => resp.parse_body::<ScopesBody>().unwrap_or_default().scopes,
-        Err(_) => return,
+        Ok(resp) if resp.success => resp.parse_body::<ScopesBody>().unwrap_or_default().scopes,
+        _ => return,
     };
-    for scope in scopes {
-        if scope.name == "Globals" && !SHOW_GLOBALS {
-            println!(
-                "  [{}] (hidden — set SHOW_GLOBALS=True to include)",
-                scope.name
-            );
+    let any_locals = any_locals_scope(&scopes);
+    for (index, scope) in scopes.into_iter().enumerate() {
+        // Show locals-style scopes by default; others (Globals, etc.) are huge
+        // and noisy. Flip SHOW_ALL_SCOPES to include everything.
+        if !SHOW_ALL_SCOPES && !scope_opens_by_default(&scope, index, any_locals) {
+            println!("  [{}] (hidden — non-locals scope)", scope.name);
             continue;
         }
         println!("  [{}]", scope.name);
@@ -126,7 +114,7 @@ async fn handle_stop(client: &DapClient, body: StoppedBody, stop_number: u64) {
     }
 }
 
-/// Recursively print a container's filtered children.
+/// Recursively print a container's children, with adapter noise filtered out.
 fn print_tree<'a>(
     client: &'a DapClient,
     var_ref: i64,
@@ -137,40 +125,23 @@ fn print_tree<'a>(
         if var_ref == 0 || depth > MAX_DEPTH {
             return;
         }
-        let Ok(resp) = client
-            .request("variables", Some(json!({ "variablesReference": var_ref })))
+        for (shown, node) in fetch_children(client, var_ref)
             .await
-        else {
-            return;
-        };
-        let variables = resp
-            .parse_body::<VariablesBody>()
-            .unwrap_or_default()
-            .variables;
-        let mut shown = 0;
-        for var in variables {
-            if is_noise(&var) {
-                continue;
-            }
+            .into_iter()
+            .enumerate()
+        {
             if shown >= MAX_CHILDREN {
                 println!("{prefix}… more");
                 break;
             }
-            shown += 1;
-            let ty = if var.ty.is_empty() {
+            let ty = if node.ty.is_empty() {
                 String::new()
             } else {
-                format!(" : {}", var.ty)
+                format!(" : {}", node.ty)
             };
-            println!("{prefix}{}{ty} = {}", var.name, var.value);
-            if var.variables_reference != 0 {
-                print_tree(
-                    client,
-                    var.variables_reference,
-                    depth + 1,
-                    format!("{prefix}    "),
-                )
-                .await;
+            println!("{prefix}{}{ty} = {}", node.name, node.value);
+            if node.var_ref != 0 {
+                print_tree(client, node.var_ref, depth + 1, format!("{prefix}    ")).await;
             }
         }
     })
