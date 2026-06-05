@@ -2,16 +2,20 @@
 
 # dap-observer
 
-A read-only, late-joining DAP client that rides a DAP multiplexer session
-and renders the current frame's variables in a terminal UI — built so
-you can watch variables in a terminal while debugging.
+You have that debugger running. Breakpoints set. But.... what are the values on the stack
+right now?? How could you possibly learn that? Well, this will do it.
+
+`dap-observer` is a small, tool that does one thing -- it connects to a DAP session and
+shows the values of the variables while the debugger steps through the code.
+
+Now, for this to work you need a multiplexer for the DAP. Otherwise your editor/IDE gets
+all of the fun. [https://github.com/dap-mux/dap-mux](dap-mux) is one of those.
 
 The observer only ever *joins* an existing multiplexer session. It does not spawn the adapter
-or manage the session. Start the debugging session however you usually do but wrap it
-in a multiplexer.
+or manage the session.
 
 ```sh
-# terminal 1 — adapter + mux (see prime-sieve/start_session.sh)
+# terminal 1 — adapter + mux
 python -m debugpy.adapter --host 127.0.0.1 --port 5678
 dap-mux --attach 5678 --headless -p 5679
 
@@ -50,7 +54,3 @@ scope stays pinned and shows `(unavailable)` until it resolves again.
 ### Headless mode
 
 `--headless` skips the TUI and prints each stop to stdout. Useful for testing.
-
-```sh
-dap-observer --headless
-```
