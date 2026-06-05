@@ -40,9 +40,10 @@ pub struct Response {
 
 impl Response {
     /// Parse the response body into a typed body, defaulting when absent.
+    /// Deserializes from a borrow of the body so the JSON tree is never cloned.
     pub fn parse_body<T: DeserializeOwned + Default>(&self) -> anyhow::Result<T> {
         match &self.body {
-            Some(b) => Ok(serde_json::from_value(b.clone())?),
+            Some(b) => Ok(T::deserialize(b)?),
             None => Ok(T::default()),
         }
     }

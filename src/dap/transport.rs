@@ -6,6 +6,7 @@
 //! `oneshot` reply), decoded events come out via an event channel.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -22,8 +23,16 @@ enum Command {
         args: Option<Value>,
         reply: oneshot::Sender<Response>,
     },
-    Disconnect,
+    Disconnect {
+        /// Fired once the `disconnect` frame has been written and flushed, so a
+        /// caller can wait for it before the process exits.
+        written: oneshot::Sender<()>,
+    },
 }
+
+/// Upper bound on the wait for the `disconnect` frame to flush, so a dead
+/// connection task can never hold up exit.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What the connection task pushes toward the app.
 pub enum ConnEvent {
@@ -54,10 +63,18 @@ impl DapClient {
             .map_err(|_| anyhow!("DAP connection closed before responding to `{command}`"))
     }
 
-    /// Send a non-terminating `disconnect`. The mux synthetic acks and the shared session keeps
-    /// running for other clients.
-    pub fn disconnect(&self) {
-        let _ = self.cmd_tx.send(Command::Disconnect);
+    /// Send a non-terminating `disconnect` and wait for it to reach the socket.
+    /// The mux synthetic-acks and the shared session keeps running for other
+    /// clients. Waiting matters because callers exit the process right after, so
+    /// a fire-and-forget send could be dropped before the frame is written.
+    pub async fn disconnect(&self) {
+        let (written, written_rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::Disconnect { written }).is_err() {
+            return;
+        }
+        // A timeout (not just the channel closing) bounds the wait: if the task
+        // is wedged mid-write we still exit rather than hang.
+        let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, written_rx).await;
     }
 }
 
@@ -86,10 +103,14 @@ async fn connection_task(
     let mut reader = BufReader::new(read_half);
     let mut pending: HashMap<i64, oneshot::Sender<Response>> = HashMap::new();
     let mut seq: i64 = 0;
+    // Once all client handles drop, `cmd_rx.recv()` returns `None` forever and
+    // would be perpetually ready; disabling the branch keeps the `select!` from
+    // busy-spinning while it drains in-flight replies/events until EOF.
+    let mut cmd_open = true;
 
     loop {
         tokio::select! {
-            cmd = cmd_rx.recv() => match cmd {
+            cmd = cmd_rx.recv(), if cmd_open => match cmd {
                 Some(Command::Request { command, args, reply }) => {
                     seq += 1;
                     pending.insert(seq, reply);
@@ -98,13 +119,15 @@ async fn connection_task(
                         break;
                     }
                 }
-                Some(Command::Disconnect) => {
+                Some(Command::Disconnect { written }) => {
                     seq += 1;
                     let _ = write_message(&mut write_half, seq, "disconnect", Some(json!({}))).await;
+                    let _ = written.send(());
                 }
-                // All client handles dropped: nothing more to send. Keep
-                // reading so in-flight replies/events can still arrive until EOF.
-                None => {}
+                // All client handles dropped: nothing more to send. Stop polling
+                // this branch and keep reading so in-flight replies/events can
+                // still arrive until EOF.
+                None => cmd_open = false,
             },
             msg = read_message(&mut reader) => match msg {
                 Ok(Some(value)) => match serde_json::from_value::<Inbound>(value) {
