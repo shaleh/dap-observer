@@ -9,7 +9,8 @@ use serde_json::json;
 
 use crate::dap::DapClient;
 use crate::dap::types::{
-    EvaluateBody, ScopesBody, StackTraceBody, StoppedBody, ThreadsBody, Variable, VariablesBody,
+    EvaluateBody, Scope, ScopesBody, StackFrame, StackTraceBody, StoppedBody, ThreadsBody,
+    Variable, VariablesBody,
 };
 
 /// Live-ness of the debug session, as inferred purely from broadcast events.
@@ -91,12 +92,12 @@ pub fn node_from_var(v: &Variable) -> VarNode {
 
 /// Build a tree node from an `evaluate` result. The watched expression doubles
 /// as the node's name and its `eval_name`.
-pub fn node_from_evaluate(expr: &str, body: EvaluateBody) -> VarNode {
+pub fn node_from_evaluate(expression: &str, body: EvaluateBody) -> VarNode {
     VarNode {
-        name: expr.to_string(),
+        name: expression.to_string(),
         value: body.result,
         ty: body.ty.unwrap_or_default(),
-        eval_name: expr.to_string(),
+        eval_name: expression.to_string(),
         var_ref: body.variables_reference,
         children: None,
         expanded: false,
@@ -110,12 +111,16 @@ pub fn node_from_evaluate(expr: &str, body: EvaluateBody) -> VarNode {
 /// observer-only contract holds. An `Err` means the expression did not resolve
 /// in the current frame (e.g. stepped out of scope); the caller keeps the watch
 /// pinned and renders it as unavailable.
-pub async fn evaluate_watch(client: &DapClient, expr: &str, frame_id: i64) -> Result<VarNode> {
+pub async fn evaluate_watch(
+    client: &DapClient,
+    expression: &str,
+    frame_id: i64,
+) -> Result<VarNode> {
     let resp = client
         .request(
             "evaluate",
             Some(json!({
-                "expression": expr,
+                "expression": expression,
                 "frameId": frame_id,
                 "context": "watch"
             })),
@@ -127,7 +132,10 @@ pub async fn evaluate_watch(client: &DapClient, expr: &str, frame_id: i64) -> Re
             resp.message.unwrap_or_else(|| "evaluate failed".into())
         );
     }
-    Ok(node_from_evaluate(expr, resp.parse_body::<EvaluateBody>()?))
+    Ok(node_from_evaluate(
+        expression,
+        resp.parse_body::<EvaluateBody>()?,
+    ))
 }
 
 /// A `Locals`-style scope: open by default. Detect via the spec-defined
@@ -136,8 +144,25 @@ pub async fn evaluate_watch(client: &DapClient, expr: &str, frame_id: i64) -> Re
 /// exact equality because adapters disagree on the exact spelling — e.g.
 /// CodeLLDB reports `Local` (singular), others `Local Variables`, and some
 /// may not set the hint at all.
-fn is_locals_scope(name: &str, hint: Option<&str>) -> bool {
+pub fn is_locals_scope(name: &str, hint: Option<&str>) -> bool {
     hint == Some("locals") || name.to_ascii_lowercase().contains("local")
+}
+
+/// Whether any scope in a frame matches the locals heuristic.
+pub fn any_locals_scope(scopes: &[Scope]) -> bool {
+    scopes
+        .iter()
+        .any(|s| is_locals_scope(&s.name, s.presentation_hint.as_deref()))
+}
+
+/// Whether a scope should be opened/shown by default. `Locals`-style scopes
+/// always are. When a frame has none — an adapter we haven't seen, with exotic
+/// naming and no hint — the first scope is the fallback, since adapters
+/// conventionally list the most relevant scope first; this keeps a useful tree
+/// open instead of a fully collapsed one. `any_locals` is whether the frame has
+/// any locals scope at all, computed once per frame by the caller.
+pub fn scope_opens_by_default(scope: &Scope, index: usize, any_locals: bool) -> bool {
+    is_locals_scope(&scope.name, scope.presentation_hint.as_deref()) || (!any_locals && index == 0)
 }
 
 /// Fetch and filter a node's children. Tolerates a stale-reference error
@@ -160,22 +185,17 @@ pub async fn fetch_children(client: &DapClient, var_ref: i64) -> Vec<VarNode> {
     }
 }
 
-/// On a stop, resolve the stopped thread's top frame, fetch its scopes, and
-/// seed scope nodes.
+/// Resolve the stopped thread's top frame via `stackTrace`.
 ///
-/// Returns `Ok(None)` for the no-frames case, which the UI shows as idle.
-pub async fn build_frame(
+/// The stop event's `thread_id` is preferred and used directly; only when it is
+/// absent do we query `threads` and fall back to the first reported thread.
+/// Returns `Ok(None)` for the no-threads / no-frames case (shown as idle).
+pub async fn resolve_top_frame(
     client: &DapClient,
-    body: StoppedBody,
-    stop_number: u64,
-) -> Result<Option<FrameContext>> {
-    // threads -> stackTrace -> scopes -> variables. The stop event carries the
-    // thread id; fall back to the first reported thread if it is absent.
-    let thread_id = match body.thread_id {
-        Some(id) => {
-            let _ = client.request("threads", Some(json!({}))).await;
-            id
-        }
+    thread_hint: Option<i64>,
+) -> Result<Option<StackFrame>> {
+    let thread_id = match thread_hint {
+        Some(id) => id,
         None => {
             let resp = client.request("threads", Some(json!({}))).await?;
             match resp.parse_body::<ThreadsBody>()?.threads.first() {
@@ -185,22 +205,38 @@ pub async fn build_frame(
         }
     };
 
-    let st = client
+    let stack_trace = client
         .request(
             "stackTrace",
             Some(json!({ "threadId": thread_id, "levels": 1 })),
         )
         .await?;
-    if !st.success {
-        // A stale/failed stackTrace (e.g. the session resumed underneath us)
-        // is treated as idle rather than fatal.
-        anyhow::bail!("stackTrace failed: {}", st.message.unwrap_or_default());
+    if !stack_trace.success {
+        // A stale/failed stackTrace (e.g. the session resumed underneath us) is
+        // idle, not fatal: report no frame so the caller shows the idle state
+        // instead of surfacing an error. A genuine transport failure is a
+        // different thing — that propagates as `Err` from the `?` above.
+        return Ok(None);
     }
-    let frames = st
+    Ok(stack_trace
         .parse_body::<StackTraceBody>()
         .unwrap_or_default()
-        .stack_frames;
-    let Some(top) = frames.into_iter().next() else {
+        .stack_frames
+        .into_iter()
+        .next())
+}
+
+/// On a stop, resolve the stopped thread's top frame, fetch its scopes, and
+/// seed scope nodes.
+///
+/// Returns `Ok(None)` for the no-frames case, which the UI shows as idle.
+pub async fn build_frame(
+    client: &DapClient,
+    body: StoppedBody,
+    stop_number: u64,
+) -> Result<Option<FrameContext>> {
+    // threads -> stackTrace -> scopes -> variables.
+    let Some(top) = resolve_top_frame(client, body.thread_id).await? else {
         return Ok(None);
     };
 
@@ -213,27 +249,23 @@ pub async fn build_frame(
         stop_number,
     };
 
-    // Tolerate a scopes failure (IOW a stale frame): show an empty tree, not a crash.
+    // A stale frame (an `Ok` response with `success == false`) is tolerated as
+    // an empty tree, but a transport error means the connection is gone — that
+    // surfaces instead of masquerading as a frame with no variables.
     let scopes = match client
         .request("scopes", Some(json!({ "frameId": frame_id })))
         .await
     {
         Ok(resp) if resp.success => resp.parse_body::<ScopesBody>().unwrap_or_default().scopes,
-        _ => Vec::new(),
+        Ok(_) => Vec::new(),
+        Err(e) => anyhow::bail!("scopes failed: {e:#}"),
     };
 
-    // Safety net: if no scope matches the locals heuristic (an adapter we
-    // haven't seen, with exotic naming and no hint), fall back to expanding the
-    // first scope. Adapters conventionally list the most relevant scope first,
-    // so this keeps a useful tree open instead of a fully collapsed one.
-    let any_locals = scopes
-        .iter()
-        .any(|s| is_locals_scope(&s.name, s.presentation_hint.as_deref()));
+    let any_locals = any_locals_scope(&scopes);
 
     let mut roots = Vec::with_capacity(scopes.len());
-    for (i, scope) in scopes.into_iter().enumerate() {
-        let expand_default = is_locals_scope(&scope.name, scope.presentation_hint.as_deref())
-            || (!any_locals && i == 0);
+    for (index, scope) in scopes.into_iter().enumerate() {
+        let expand_default = scope_opens_by_default(&scope, index, any_locals);
         let mut node = VarNode {
             name: scope.name,
             value: String::new(),
