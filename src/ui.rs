@@ -1,7 +1,8 @@
 use std::io::{self, Stdout};
+use std::ops::{Deref, DerefMut};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -16,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::dap::types::{EventMessage, StoppedBody};
-use crate::dap::{ConnEvent, DapClient, initialize_args};
+use crate::dap::{ConnEvent, DapClient, initialize};
 use crate::model::{
     FrameContext, FrameHeader, SessionState, VarNode, build_frame, evaluate_watch, fetch_children,
 };
@@ -38,7 +39,7 @@ enum UpdateKind {
     },
     /// A watch finished evaluating: `Some` resolved, `None` out of scope.
     Watch {
-        expr: String,
+        expression: String,
         node: Option<VarNode>,
     },
     Error {
@@ -52,7 +53,10 @@ enum FetchTarget {
     /// Scope tree: positional path (scopes are stable within a stop).
     Scope { path: Vec<usize> },
     /// Watch subtree: the (stable) expression plus a path below its root node.
-    Watch { expr: String, subpath: Vec<usize> },
+    Watch {
+        expression: String,
+        subpath: Vec<usize>,
+    },
 }
 
 /// Which forest a visible row belongs to.
@@ -64,7 +68,7 @@ enum Tree {
 
 /// A pinned watch: a durable expression plus the most recent evaluation.
 struct Watch {
-    expr: String,
+    expression: String,
     state: WatchState,
 }
 
@@ -104,6 +108,46 @@ struct Row {
     placeholder: bool,
 }
 
+/// A value paired with a version that advances on every mutable access.
+///
+/// The row cache is valid only as long as the variable tree (`roots`) and watch
+/// list (`watches`) it was flattened from are unchanged. Tying the version to
+/// `DerefMut` makes that dependency unforgeable: reaching the data to mutate it
+/// *is* the invalidation, so no call site can change the structure without
+/// advancing the version, and `sync_rows` can never silently skip a needed
+/// rebuild. It is deliberately conservative — a mutable borrow that ends up
+/// changing nothing still bumps — trading a rare redundant rebuild for the
+/// guarantee that staleness is impossible.
+struct Tracked<T> {
+    value: T,
+    version: u64,
+}
+
+impl<T> Tracked<T> {
+    fn new(value: T) -> Self {
+        Tracked { value, version: 0 }
+    }
+
+    fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+impl<T> Deref for Tracked<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> DerefMut for Tracked<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.version += 1;
+        &mut self.value
+    }
+}
+
 struct App {
     client: DapClient,
     state: SessionState,
@@ -114,15 +158,22 @@ struct App {
     /// Current frame id, needed to `evaluate` watches. Set when a frame
     /// resolves, cleared on stop/idle.
     frame_id: Option<i64>,
-    roots: Vec<VarNode>,
-    /// Durable watch list: the `expr`s survive re-rooting; each `state` is
+    roots: Tracked<Vec<VarNode>>,
+    /// Durable watch list: the `expression`s survive re-rooting; each `state` is
     /// ephemeral and re-evaluated every stop.
-    watches: Vec<Watch>,
+    watches: Tracked<Vec<Watch>>,
     selected: usize,
     status: String,
     should_quit: bool,
     list_state: ListState,
     update_tx: tokio::sync::mpsc::UnboundedSender<Update>,
+    /// Cached flattened rows, rebuilt by `sync_rows` only when the version of
+    /// `roots` or `watches` advances. Selection moves and idle 200ms ticks
+    /// touch neither mutably, so they reuse the cache rather than re-flattening
+    /// and re-cloning the tree.
+    rows: Vec<Row>,
+    /// The `(roots, watches)` versions the cached `rows` were built from.
+    rows_built_at: (u64, u64),
 }
 
 /// Connect-time handshake + UI event loop. Owns the terminal and restores it on
@@ -131,10 +182,7 @@ pub async fn run(
     client: DapClient,
     mut events: tokio::sync::mpsc::UnboundedReceiver<ConnEvent>,
 ) -> Result<()> {
-    client
-        .request("initialize", Some(initialize_args()))
-        .await
-        .context("initialize handshake failed")?;
+    initialize(&client).await?;
 
     install_panic_hook();
     let mut terminal = setup_terminal()?;
@@ -169,7 +217,7 @@ pub async fn run(
 
     // Clean exit: non-terminating disconnect, then the guard restores the
     // terminal as it drops.
-    client.disconnect();
+    client.disconnect().await;
     Ok(())
 }
 
@@ -182,13 +230,17 @@ impl App {
             stop_count: 0,
             header: None,
             frame_id: None,
-            roots: Vec::new(),
-            watches: Vec::new(),
+            roots: Tracked::new(Vec::new()),
+            watches: Tracked::new(Vec::new()),
             selected: 0,
             status: "waiting for the program to stop (breakpoint or step)…".to_string(),
             should_quit: false,
             list_state: ListState::default(),
             update_tx,
+            rows: Vec::new(),
+            // No real version pair can equal this, so the first `sync_rows`
+            // always builds.
+            rows_built_at: (u64::MAX, u64::MAX),
         }
     }
 
@@ -202,9 +254,10 @@ impl App {
                 self.roots.clear();
                 self.header = None;
                 self.frame_id = None;
-                // Watches persist, but their values are re-evaluated once the
-                // frame resolves (see the Frame update handler).
-                for w in &mut self.watches {
+                // Watches persist across re-rooting, but their last values are
+                // stale: mark each pending until the new frame resolves and it
+                // is re-evaluated against that frame.
+                for w in self.watches.iter_mut() {
                     w.state = WatchState::Pending;
                 }
                 self.selected = 0;
@@ -229,10 +282,15 @@ impl App {
                 });
             }
             "continued" => {
-                // Program resumed: the last stop's handles are now invalid,
-                // so we can't fetch live data. We intentionally do NOT clear
-                // the tree here, leaving the last tree on screen — just flagged
-                // as stale. The next `stopped` re-roots it.
+                // Program resumed: the last stop's `variablesReference` handles
+                // are now invalid, so a `build_frame` or fetch still in flight
+                // from that stop would land stale. Bump the epoch so those
+                // replies are discarded rather than applied over the running
+                // session (which would repopulate the frame and fire watch
+                // `evaluate`s against a dead frame). We deliberately keep the
+                // old tree on screen, flagged stale; the next `stopped`
+                // re-roots it.
+                self.epoch += 1;
                 self.state = SessionState::Running;
                 self.status = "running — variables stale".to_string();
             }
@@ -265,44 +323,50 @@ impl App {
                     Some(c) => {
                         self.header = Some(c.header);
                         self.frame_id = Some(c.frame_id);
-                        self.roots = c.roots;
+                        // Deref-assign (not `self.roots = …`) so the version
+                        // bumps and the row cache rebuilds.
+                        *self.roots = c.roots;
                         self.status = "stopped".to_string();
                         // Now that the frame is known, evaluate every watch
                         // against it. Collect first to avoid borrowing `self`
                         // mutably and immutably at once.
-                        let exprs: Vec<String> =
-                            self.watches.iter().map(|w| w.expr.clone()).collect();
-                        for expr in exprs {
-                            self.spawn_watch(expr, c.frame_id);
+                        let expressions: Vec<String> =
+                            self.watches.iter().map(|w| w.expression.clone()).collect();
+                        for expression in expressions {
+                            self.spawn_watch(expression, c.frame_id);
                         }
                     }
                     None => {
                         self.frame_id = None;
                         self.status = "stopped — no frames (idle)".to_string();
+                        // No frame to evaluate against, so pinned watches can
+                        // never resolve this stop: flip them from Pending to
+                        // Unavailable rather than leaving them spinning on "…".
+                        for w in self.watches.iter_mut() {
+                            w.state = WatchState::Unavailable;
+                        }
                     }
                 }
-                self.clamp_selection();
             }
             UpdateKind::Children { target, children } => {
                 let node = match &target {
                     FetchTarget::Scope { path } => self.scope_node_mut(path),
-                    FetchTarget::Watch { expr, subpath } => {
-                        self.watch_node_mut_by_expr(expr, subpath)
-                    }
+                    FetchTarget::Watch {
+                        expression,
+                        subpath,
+                    } => self.watch_node_mut_by_expression(expression, subpath),
                 };
                 if let Some(node) = node {
                     node.children = Some(children);
                 }
-                self.clamp_selection();
             }
-            UpdateKind::Watch { expr, node } => {
-                if let Some(w) = self.watches.iter_mut().find(|w| w.expr == expr) {
+            UpdateKind::Watch { expression, node } => {
+                if let Some(w) = self.watches.iter_mut().find(|w| w.expression == expression) {
                     w.state = match node {
                         Some(n) => WatchState::Resolved(n),
                         None => WatchState::Unavailable,
                     };
                 }
-                self.clamp_selection();
             }
             UpdateKind::Error { message } => self.status = format!("error: {message}"),
         }
@@ -312,89 +376,96 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        let rows = self.visible_rows();
+        self.sync_rows();
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true
             }
-            KeyCode::Down | KeyCode::Char('j') => self.step_selection(&rows, true),
-            KeyCode::Up | KeyCode::Char('k') => self.step_selection(&rows, false),
-            KeyCode::Char('g') => self.selected = first_selectable(&rows),
-            KeyCode::Char('G') => self.selected = last_selectable(&rows),
-            KeyCode::Enter | KeyCode::Char(' ') => self.set_expanded(&rows, ExpandAction::Toggle),
-            KeyCode::Right | KeyCode::Char('l') => self.set_expanded(&rows, ExpandAction::Expand),
-            KeyCode::Left | KeyCode::Char('h') => self.set_expanded(&rows, ExpandAction::Collapse),
-            KeyCode::Char('w') => self.toggle_watch(&rows),
+            KeyCode::Down | KeyCode::Char('j') => self.step_selection(true),
+            KeyCode::Up | KeyCode::Char('k') => self.step_selection(false),
+            KeyCode::Char('g') => self.selected = first_selectable(&self.rows),
+            KeyCode::Char('G') => self.selected = last_selectable(&self.rows),
+            KeyCode::Enter | KeyCode::Char(' ') => self.set_expanded(ExpandAction::Toggle),
+            KeyCode::Right | KeyCode::Char('l') => self.set_expanded(ExpandAction::Expand),
+            KeyCode::Left | KeyCode::Char('h') => self.set_expanded(ExpandAction::Collapse),
+            KeyCode::Char('w') => self.toggle_watch(),
             _ => {}
         }
     }
 
     /// Move the selection to the next/previous selectable row, skipping the
     /// non-selectable section header.
-    fn step_selection(&mut self, rows: &[Row], forward: bool) {
-        let n = rows.len() as isize;
+    fn step_selection(&mut self, forward: bool) {
+        let n = self.rows.len() as isize;
         let mut i = self.selected as isize;
         loop {
             i += if forward { 1 } else { -1 };
             if i < 0 || i >= n {
                 return;
             }
-            if rows[i as usize].selectable {
+            if self.rows[i as usize].selectable {
                 self.selected = i as usize;
                 return;
             }
         }
     }
 
-    /// Toggle a watch with `w`: from a watched row, unpin it; from a scope
-    /// variable, pin or unpin it by its `evaluateName`. No-op without one.
-    fn toggle_watch(&mut self, rows: &[Row]) {
-        let Some(row) = rows.get(self.selected) else {
-            return;
+    /// Toggle a watch with `w`. On a watch ROOT row, unpin that watch. On any
+    /// other row — a scope variable or a nested child *inside* a watch — pin or
+    /// unpin it by its own `evaluateName`, so pressing `w` deep in a watch's
+    /// subtree adds that descendant as its own watch instead of removing the
+    /// whole root. No-op without an `evaluateName`.
+    fn toggle_watch(&mut self) {
+        let (is_watch_root, root_watch_index, expression) = {
+            let Some(row) = self.rows.get(self.selected) else {
+                return;
+            };
+            (
+                row.tree == Tree::Watch && row.path.len() == 1,
+                row.path.first().copied(),
+                row.eval_name.clone(),
+            )
         };
-        if row.tree == Tree::Watch {
-            // Unpin the selected watch (its root is the first path element).
-            if let Some(&wi) = row.path.first()
-                && wi < self.watches.len()
+        if is_watch_root {
+            if let Some(watch_index) = root_watch_index
+                && watch_index < self.watches.len()
             {
-                self.watches.remove(wi);
+                self.watches.remove(watch_index);
             }
-            self.clamp_selection();
             return;
         }
-        let expr = row.eval_name.clone();
-        if expr.is_empty() {
+        if expression.is_empty() {
             return;
         }
-        if let Some(pos) = self.watches.iter().position(|w| w.expr == expr) {
+        if let Some(pos) = self.watches.iter().position(|w| w.expression == expression) {
             self.watches.remove(pos);
         } else {
             self.watches.push(Watch {
-                expr: expr.clone(),
+                expression: expression.clone(),
                 state: WatchState::Pending,
             });
             // Pinned while stopped: evaluate immediately against the live frame.
             if self.state == SessionState::Stopped
-                && let Some(fid) = self.frame_id
+                && let Some(frame_id) = self.frame_id
             {
-                self.spawn_watch(expr, fid);
+                self.spawn_watch(expression, frame_id);
             }
         }
-        self.clamp_selection();
     }
 
     /// Expand/collapse the selected node, triggering a lazy fetch on first
     /// expand. Non-expandable leaves issue no request.
-    fn set_expanded(&mut self, rows: &[Row], action: ExpandAction) {
-        let Some(row) = rows.get(self.selected) else {
-            return;
+    fn set_expanded(&mut self, action: ExpandAction) {
+        let (tree, path) = {
+            let Some(row) = self.rows.get(self.selected) else {
+                return;
+            };
+            if !row.expandable {
+                return;
+            }
+            (row.tree, row.path.clone())
         };
-        if !row.expandable {
-            return;
-        }
-        let tree = row.tree;
-        let path = row.path.clone();
         let node = match tree {
             Tree::Scope => self.scope_node_mut(&path),
             Tree::Watch => self.watch_node_mut(&path),
@@ -415,7 +486,7 @@ impl App {
             let target = match tree {
                 Tree::Scope => FetchTarget::Scope { path },
                 Tree::Watch => FetchTarget::Watch {
-                    expr: self.watches[path[0]].expr.clone(),
+                    expression: self.watches[path[0]].expression.clone(),
                     subpath: path[1..].to_vec(),
                 },
             };
@@ -436,15 +507,15 @@ impl App {
         });
     }
 
-    fn spawn_watch(&self, expr: String, frame_id: i64) {
+    fn spawn_watch(&self, expression: String, frame_id: i64) {
         let client = self.client.clone();
         let tx = self.update_tx.clone();
         let epoch = self.epoch;
         tokio::spawn(async move {
-            let node = evaluate_watch(&client, &expr, frame_id).await.ok();
+            let node = evaluate_watch(&client, &expression, frame_id).await.ok();
             let _ = tx.send(Update {
                 epoch,
-                kind: UpdateKind::Watch { expr, node },
+                kind: UpdateKind::Watch { expression, node },
             });
         });
     }
@@ -457,8 +528,8 @@ impl App {
 
     /// Locate a watch node by positional path (path[0] indexes `watches`).
     fn watch_node_mut(&mut self, path: &[usize]) -> Option<&mut VarNode> {
-        let (&wi, rest) = path.split_first()?;
-        let WatchState::Resolved(root) = &mut self.watches.get_mut(wi)?.state else {
+        let (&watch_index, rest) = path.split_first()?;
+        let WatchState::Resolved(root) = &mut self.watches.get_mut(watch_index)?.state else {
             return None;
         };
         descend(root, rest)
@@ -467,28 +538,37 @@ impl App {
     /// Locate a node within a watch's subtree by the watch's (stable)
     /// expression — used when an async children reply lands, so a concurrent
     /// watch-list edit can't misdirect it.
-    fn watch_node_mut_by_expr(&mut self, expr: &str, subpath: &[usize]) -> Option<&mut VarNode> {
-        let w = self.watches.iter_mut().find(|w| w.expr == expr)?;
+    fn watch_node_mut_by_expression(
+        &mut self,
+        expression: &str,
+        subpath: &[usize],
+    ) -> Option<&mut VarNode> {
+        let w = self
+            .watches
+            .iter_mut()
+            .find(|w| w.expression == expression)?;
         let WatchState::Resolved(root) = &mut w.state else {
             return None;
         };
         descend(root, subpath)
     }
 
+    /// Re-clamp the selection against the current cached `rows`, moving off a
+    /// now-out-of-range or non-selectable index to the nearest selectable row.
+    /// Called by `sync_rows` after it rebuilds.
     fn clamp_selection(&mut self) {
-        let rows = self.visible_rows();
-        if rows.is_empty() {
+        if self.rows.is_empty() {
             self.selected = 0;
             return;
         }
-        if self.selected >= rows.len() {
-            self.selected = rows.len() - 1;
+        if self.selected >= self.rows.len() {
+            self.selected = self.rows.len() - 1;
         }
-        if !rows[self.selected].selectable {
+        if !self.rows[self.selected].selectable {
             // Prefer the next selectable row, else fall back to the previous.
-            self.selected = match rows[self.selected..].iter().position(|r| r.selectable) {
+            self.selected = match self.rows[self.selected..].iter().position(|r| r.selectable) {
                 Some(off) => self.selected + off,
-                None => rows[..self.selected]
+                None => self.rows[..self.selected]
                     .iter()
                     .rposition(|r| r.selectable)
                     .unwrap_or(0),
@@ -496,27 +576,44 @@ impl App {
         }
     }
 
+    /// Rebuild the cached row list when the version of `roots` or `watches` has
+    /// advanced since the last build, then re-clamp the selection against the
+    /// fresh rows. A no-op when neither was touched mutably (selection moves,
+    /// idle ticks), so those paths neither re-flatten nor re-clone the tree.
+    fn sync_rows(&mut self) {
+        let current = (self.roots.version(), self.watches.version());
+        if self.rows_built_at != current {
+            self.rows = self.build_rows();
+            self.rows_built_at = current;
+            self.clamp_selection();
+        }
+    }
+
     /// Flatten the watch section and scope tree into the rows currently visible
     /// (collapsed subtrees omitted). Watches come first under a header, then the
     /// scopes; every node row carries its `(tree, path)` address.
-    fn visible_rows(&self) -> Vec<Row> {
+    fn build_rows(&self) -> Vec<Row> {
         let mut out = Vec::new();
         if !self.watches.is_empty() {
             out.push(Row::header("watched"));
-            for (wi, w) in self.watches.iter().enumerate() {
+            for (watch_index, w) in self.watches.iter().enumerate() {
                 match &w.state {
                     WatchState::Resolved(node) => {
-                        out.push(Row::node(Tree::Watch, vec![wi], 0, node));
+                        out.push(Row::node(Tree::Watch, vec![watch_index], 0, node));
                         if node.expanded
                             && let Some(children) = &node.children
                         {
-                            walk_nodes(Tree::Watch, &[wi], children, 1, &mut out);
+                            walk_nodes(Tree::Watch, &[watch_index], children, 1, &mut out);
                         }
                     }
-                    WatchState::Pending => out.push(Row::watch_placeholder(wi, &w.expr, "…")),
-                    WatchState::Unavailable => {
-                        out.push(Row::watch_placeholder(wi, &w.expr, "(unavailable)"))
+                    WatchState::Pending => {
+                        out.push(Row::watch_placeholder(watch_index, &w.expression, "…"))
                     }
+                    WatchState::Unavailable => out.push(Row::watch_placeholder(
+                        watch_index,
+                        &w.expression,
+                        "(unavailable)",
+                    )),
                 }
             }
         }
@@ -525,6 +622,7 @@ impl App {
     }
 
     fn render(&mut self, f: &mut ratatui::Frame) {
+        self.sync_rows();
         let chunks = Layout::vertical([
             Constraint::Length(4),
             Constraint::Min(1),
@@ -576,9 +674,12 @@ impl App {
     }
 
     fn render_tree(&mut self, f: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-        let rows = self.visible_rows();
         let live = self.state == SessionState::Stopped;
-        let items: Vec<ListItem> = rows.iter().map(|row| row_list_item(row, live)).collect();
+        let items: Vec<ListItem> = self
+            .rows
+            .iter()
+            .map(|row| row_list_item(row, live))
+            .collect();
 
         let title = match self.state {
             SessionState::Running => " variables (stale — running) ",
@@ -590,7 +691,7 @@ impl App {
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .highlight_symbol("› ");
 
-        self.list_state.select(if rows.is_empty() {
+        self.list_state.select(if self.rows.is_empty() {
             None
         } else {
             Some(self.selected)
@@ -682,15 +783,15 @@ impl Row {
     }
 
     /// A watch row that has no value yet (pending) or did not resolve.
-    fn watch_placeholder(wi: usize, expr: &str, status: &str) -> Row {
+    fn watch_placeholder(watch_index: usize, expression: &str, status: &str) -> Row {
         Row {
             tree: Tree::Watch,
-            path: vec![wi],
+            path: vec![watch_index],
             depth: 0,
-            name: expr.to_string(),
+            name: expression.to_string(),
             value: status.to_string(),
             ty: String::new(),
-            eval_name: expr.to_string(),
+            eval_name: expression.to_string(),
             expandable: false,
             expanded: false,
             fetched: false,
