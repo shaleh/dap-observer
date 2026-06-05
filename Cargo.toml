@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dap-client", "crates/dap-observer"]
+members = ["crates/dap-client", "crates/dap-observer", "crates/dap-repl"]
 
 [workspace.dependencies]
 anyhow = "1"
@@ -16,6 +16,7 @@ tokio = { version = "1", features = [
     "sync",
     "macros",
     "io-util",
+    "io-std",
     "time",
     "signal",
 ] }
