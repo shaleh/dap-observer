@@ -54,7 +54,7 @@ pub async fn run(client: DapClient, mut events: UnboundedReceiver<ConnEvent>) ->
         // session. We are still attached to the shared mux, so we end the loop
         // and disconnect on the way out the same as any other exit.
         if terminal
-            .draw(|f| render(&model, &mut vars_state, &mut stack_state, f))
+            .draw(|f| render(&client, &model, &mut vars_state, &mut stack_state, f))
             .is_err()
         {
             break;
@@ -253,6 +253,7 @@ fn run_effects(effects: Vec<Effect>, client: &DapClient, update_tx: &UnboundedSe
 }
 
 fn render(
+    client: &DapClient,
     model: &DebuggerModel,
     vars_state: &mut ListState,
     stack_state: &mut ListState,
@@ -266,7 +267,7 @@ fn render(
     ])
     .split(f.area());
 
-    render_header(model, f, chunks[0]);
+    render_header(client, model, f, chunks[0]);
 
     let body =
         Layout::horizontal([Constraint::Percentage(35), Constraint::Min(1)]).split(chunks[1]);
@@ -281,7 +282,7 @@ fn render(
     }
 }
 
-fn render_header(model: &DebuggerModel, f: &mut ratatui::Frame, area: Rect) {
+fn render_header(client: &DapClient, model: &DebuggerModel, f: &mut ratatui::Frame, area: Rect) {
     let (label, color) = match model.state {
         SessionState::Connecting => ("● connecting…", Color::Yellow),
         SessionState::Running => ("▶ RUNNING — variables not live", Color::Yellow),
@@ -310,7 +311,11 @@ fn render_header(model: &DebuggerModel, f: &mut ratatui::Frame, area: Rect) {
         )),
     };
 
-    let block = Block::default().borders(Borders::ALL).title(" dap-tui ");
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " {} @ {} ",
+        env!("CARGO_BIN_NAME"),
+        client.address()
+    ));
     let body = vec![
         Line::from(Span::styled(
             label,

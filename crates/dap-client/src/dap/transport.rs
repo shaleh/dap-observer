@@ -45,6 +45,7 @@ pub enum ConnEvent {
 /// Handle to the connection task.
 #[derive(Clone)]
 pub struct DapClient {
+    address: String,
     cmd_tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -76,6 +77,10 @@ impl DapClient {
         // is wedged mid-write we still exit rather than hang.
         let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, written_rx).await;
     }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
 }
 
 /// Connect to `address` and spawn the connection task.
@@ -90,7 +95,13 @@ pub async fn connect(address: &str) -> Result<(DapClient, mpsc::UnboundedReceive
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     tokio::spawn(connection_task(stream, cmd_rx, event_tx));
-    Ok((DapClient { cmd_tx }, event_rx))
+    Ok((
+        DapClient {
+            address: address.to_string(),
+            cmd_tx,
+        },
+        event_rx,
+    ))
 }
 
 async fn connection_task(
