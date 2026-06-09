@@ -1,0 +1,36 @@
+# Launch the Rust sieve and probe it, with no editor.
+#
+# Build the binary first:
+#   rust/build.sh
+#
+# The dump renders Vec, HashMap, and String cleanly because the launch loads
+# the data formatters that ship with the Rust toolchain. They live under the
+# active toolchain's sysroot, a machine-specific path, so the script reads it
+# from an environment variable you export first:
+#   export RUST_SYSROOT="$(rustc --print sysroot)"
+#
+# Then, two ways to run:
+#
+#   Solo, no mux. Start just the adapter:
+#     lldb-dap --connection listen://127.0.0.1:5678
+#     dap-script rust/launch.daps --address 5678 | jq
+#
+#   Shared, through a mux:
+#     ./start-session.sh rust
+#     dap-script rust/launch.daps
+#
+# `${dir}` expands to this file's directory and `${env:NAME}` to an environment
+# variable, so the script carries no absolute paths.
+
+connect
+launch {
+  "request": "launch",
+  "program": "${dir}/sieve",
+  "initCommands": [
+    "command script import \"${env:RUST_SYSROOT}/lib/rustlib/etc/lldb_lookup.py\"",
+    "command source \"${env:RUST_SYSROOT}/lib/rustlib/etc/lldb_commands\""
+  ]
+}
+break sieve.rs:26
+expect stopped
+dump locals as json

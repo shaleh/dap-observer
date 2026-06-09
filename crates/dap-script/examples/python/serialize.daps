@@ -1,0 +1,18 @@
+# Serialize a rich value with the debuggee's own runtime.
+#
+# crossed_off is a dict[int, list[int]]. The variable tree can only show the
+# adapter's display string for it. Letting Python's json render it produces
+# machine-readable JSON instead.
+#
+# Note: debugpy returns a repl result as a Python repr, so the JSON comes back
+# wrapped in single quotes. Strip them before piping to jq, or use
+# `dump eval ... as json` for a value that expands cleanly in the tree.
+#
+# Setup as probe-locals.daps.
+# Run:
+#   dap-script python/serialize.daps | sed "s/^'//; s/'$//" | jq
+
+connect
+expect stopped
+continue until eval "p" == "3"
+print eval "__import__('json').dumps(crossed_off)"

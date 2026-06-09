@@ -1,0 +1,9 @@
+# A human-readable summary of where the session is parked, using print
+# interpolation of frame fields and evaluated expressions.
+#
+# Same setup as probe-locals.daps.
+
+connect
+expect stopped
+print "stopped in {frame.name} at {frame.source}:{frame.line}"
+print "p={eval \"p\"} multiple={eval \"multiple\"} eliminated so far={eval \"len(eliminated)\"}"

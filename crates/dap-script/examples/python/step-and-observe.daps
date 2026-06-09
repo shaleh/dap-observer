@@ -1,0 +1,16 @@
+# Shared-session check. Run this while another client is attached to the same
+# mux (a dap-tui, or the launch.daps run that parked the session).
+#
+# The single step below moves the program for every client, so an attached
+# dap-tui jumps to the new line too. When this script exits, its disconnect is
+# non-terminating, so the mux keeps the session alive for the other clients.
+#
+# Setup as probe-locals.daps, plus a dap-tui on 5679 in another terminal.
+# Run:
+#   dap-script python/step-and-observe.daps
+
+connect
+expect stopped
+print "before: line {frame.line}"
+next
+print "after:  line {frame.line}"

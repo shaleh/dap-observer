@@ -1,0 +1,25 @@
+# Launch the Go sieve and probe it, with no editor and no park.py.
+#
+# Two ways to run, from the examples directory:
+#
+#   Solo, no mux. Start just the adapter:
+#     dlv dap --listen=127.0.0.1:5678
+#     dap-script go/launch.daps --address 5678
+#
+#   Shared, through a mux:
+#     ./start-session.sh go
+#     dap-script go/launch.daps
+#
+# `${dir}` expands to this file's directory. dlvCwd points delve at the module
+# so its build finds go.mod even though the module is nested in this repo.
+
+connect
+launch {
+  "request": "launch",
+  "mode": "debug",
+  "program": "${dir}",
+  "dlvCwd": "${dir}"
+}
+break sieve.go:27
+expect stopped
+dump locals as json

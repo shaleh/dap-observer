@@ -1,0 +1,12 @@
+# Probe a parked session and emit its locals as JSON.
+#
+# This is the observer role: it joins a session launched elsewhere. Park one
+# first, from the examples directory:
+#   ./start-session.sh python      # terminal 1: debugpy.adapter + mux
+#   dap-script python/launch.daps   # terminal 2: launches sieve.py and leaves it parked at sieve.py:48
+# Then probe it:
+#   dap-script python/probe-locals.daps | jq
+
+connect
+expect stopped
+dump locals as json

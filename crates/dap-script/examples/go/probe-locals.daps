@@ -1,0 +1,12 @@
+# Probe a parked session and emit its locals as JSON.
+#
+# This is the observer role: it joins a session launched elsewhere. Park one
+# first, from the examples directory:
+#   ./start-session.sh go          # terminal 1: dlv dap + mux
+#   dap-script go/launch.daps       # terminal 2: launches sieve.go and leaves it parked at sieve.go:27
+# Then probe it:
+#   dap-script go/probe-locals.daps | jq
+
+connect
+expect stopped
+dump locals as json

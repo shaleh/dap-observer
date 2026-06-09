@@ -1,0 +1,3 @@
+# Built by `rustc -g sieve.rs -o sieve`
+/sieve
+/sieve.dSYM/

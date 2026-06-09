@@ -1,0 +1,14 @@
+# Replay: drive a fresh session to the point where the prime 3 begins crossing
+# off its multiples, then dump the nested state on arrival. This is the runbook
+# shape, a repeatable walk to a state that is awkward to breakpoint directly.
+#
+# Setup as probe-locals.daps. The breakpoint at sieve.py:48 is what continue
+# stops on; this walks across all of p==2's eliminations to the first by p==3.
+# Run:
+#   dap-script python/walk-to-prime.daps
+
+connect
+expect stopped
+continue until eval "p" == "3"
+print "arrived: p={eval \"p\"} at line {frame.line}, crossed off so far:"
+dump eval "crossed_off" as json depth 3

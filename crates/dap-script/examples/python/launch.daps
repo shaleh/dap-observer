@@ -1,0 +1,27 @@
+# Launch the sieve and probe it, with no editor and no park.py. dap-script is
+# the launching client here.
+#
+# Two ways to run, from the examples directory:
+#
+#   Solo, no mux. Start just the adapter:
+#     PYTHON=/path/to/python-with-debugpy python3 -m debugpy.adapter --host 127.0.0.1 --port 5678
+#     dap-script python/launch.daps --address 5678
+#
+#   Shared, through a mux (a dap-tui can attach to what this launches):
+#     ./start-session.sh python
+#     dap-script python/launch.daps
+#
+# `${dir}` expands to this file's directory, so the paths need no editing.
+
+connect
+launch {
+  "request": "launch",
+  "type": "python",
+  "program": "${dir}/sieve.py",
+  "cwd": "${dir}",
+  "console": "internalConsole",
+  "justMyCode": true
+}
+break sieve.py:48
+expect stopped
+dump locals as json
