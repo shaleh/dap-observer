@@ -25,7 +25,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use dap_client::dap::{ConnEvent, DapClient, initialize};
 use dap_client::model::{
-    SessionState, build_scope_roots, drive, evaluate, evaluate_watch, fetch_children, resolve_stop,
+    EvalContext, SessionState, build_scope_roots, drive, evaluate, fetch_children, resolve_stop,
 };
 
 use crate::model::{DebuggerModel, HELP_LINES, InputMode, Row, RowKind, Tone, Tree};
@@ -210,7 +210,7 @@ fn run_effects(effects: Vec<Effect>, client: &DapClient, update_tx: &UnboundedSe
                 epoch,
             } => {
                 tokio::spawn(async move {
-                    let result = evaluate(&client, &expression, frame_id)
+                    let result = evaluate(&client, &expression, frame_id, EvalContext::Repl)
                         .await
                         .map_err(|e| e.to_string());
                     let _ = tx.send(Update {
@@ -225,7 +225,9 @@ fn run_effects(effects: Vec<Effect>, client: &DapClient, update_tx: &UnboundedSe
                 epoch,
             } => {
                 tokio::spawn(async move {
-                    let node = evaluate_watch(&client, &expression, frame_id).await.ok();
+                    let node = evaluate(&client, &expression, frame_id, EvalContext::Watch)
+                        .await
+                        .ok();
                     let _ = tx.send(Update {
                         epoch,
                         kind: UpdateKind::Watch { expression, node },

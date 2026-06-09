@@ -87,40 +87,6 @@ pub fn node_from_evaluate(expression: &str, body: EvaluateBody) -> VarNode {
     }
 }
 
-/// Evaluate a single watch expression against `frame_id`.
-///
-/// Uses `context: "watch"` and only ever an adapter-provided `evaluateName`, so
-/// it recomputes an existing variable and stays side-effect-free — the
-/// observer-only contract holds. An `Err` means the expression did not resolve
-/// in the current frame (e.g. stepped out of scope). The caller keeps the watch
-/// pinned and renders it as unavailable.
-pub async fn evaluate_watch(
-    client: &DapClient,
-    expression: &str,
-    frame_id: i64,
-) -> Result<VarNode> {
-    let resp = client
-        .request(
-            "evaluate",
-            Some(json!({
-                "expression": expression,
-                "frameId": frame_id,
-                "context": "watch"
-            })),
-        )
-        .await?;
-    if !resp.success {
-        anyhow::bail!(
-            "{}",
-            resp.message.unwrap_or_else(|| "evaluate failed".into())
-        );
-    }
-    Ok(node_from_evaluate(
-        expression,
-        resp.parse_body::<EvaluateBody>()?,
-    ))
-}
-
 /// A `Locals`-style scope: open by default. Detect via the spec-defined
 /// `presentationHint` first which is portable across adapters, falling back
 /// to a loose name match. The name fallback uses partial match rather than
@@ -261,22 +227,46 @@ pub async fn build_scope_roots(client: &DapClient, frame_id: i64) -> Result<Vec<
     Ok(roots)
 }
 
-/// Evaluate a user-typed expression against a frame using the [repl evaluate
-/// context](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_Evaluate)
-/// of the Debug Adapter Protocol.
+/// The [evaluate context](https://microsoft.github.io/debug-adapter-protocol/specification#Requests_Evaluate)
+/// of the Debug Adapter Protocol, which tells the adapter how to interpret an
+/// expression and how to render its result. `Watch` asks for the value as the
+/// variables view would show it, which adapters return cleanly. `Repl` runs the
+/// expression as a debug-console entry, which some adapters, lldb among them,
+/// echo back in a verbose typed command form rather than a bare value.
+#[derive(Clone, Copy)]
+pub enum EvalContext {
+    Watch,
+    Repl,
+}
+
+impl EvalContext {
+    fn as_str(self) -> &'static str {
+        match self {
+            EvalContext::Watch => "watch",
+            EvalContext::Repl => "repl",
+        }
+    }
+}
+
+/// Evaluate an expression against a frame and return the result as a node, so a
+/// structured value can be expanded and pinned like any frame variable.
 ///
-/// That context is not sandboxed. A typed expression can assign to variables or
-/// call functions, so evaluating one can change the running program. The result
-/// is returned as a node so a structured value can be expanded and pinned as a
-/// watch like any frame variable.
-pub async fn evaluate(client: &DapClient, expression: &str, frame_id: i64) -> Result<VarNode> {
+/// Neither context is sandboxed in practice. An expression can call functions or
+/// assign, so evaluating one can change the running program. That is what lets a
+/// rich value be serialized through the debuggee's own runtime.
+pub async fn evaluate(
+    client: &DapClient,
+    expression: &str,
+    frame_id: i64,
+    context: EvalContext,
+) -> Result<VarNode> {
     let resp = client
         .request(
             "evaluate",
             Some(json!({
                 "expression": expression,
                 "frameId": frame_id,
-                "context": "repl"
+                "context": context.as_str()
             })),
         )
         .await?;

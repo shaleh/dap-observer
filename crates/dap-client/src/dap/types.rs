@@ -107,6 +107,16 @@ pub struct Source {
     pub path: Option<String>,
 }
 
+impl Source {
+    /// The most specific identifier for a source: the full path when the adapter
+    /// gave one, otherwise the bare name. Suited to machine output. A display
+    /// surface that wants the short name first should prefer name over path
+    /// directly rather than calling this.
+    pub fn label(&self) -> Option<String> {
+        self.path.clone().or_else(|| self.name.clone())
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScopesBody {
