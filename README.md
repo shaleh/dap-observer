@@ -1,6 +1,6 @@
 ![Screenshot](./assets/screenshot.png)
 
-# dap-observer
+# dap-tui
 
 You have that debugger running. Breakpoints set. But.... what are the values on the stack
 right now?? How could you possibly learn that? Well, this will do it.
@@ -9,7 +9,7 @@ right now?? How could you possibly learn that? Well, this will do it.
 shows the values of the variables while the debugger steps through the code.
 
 Now, for this to work you need a multiplexer for the DAP. Otherwise your editor/IDE gets
-all of the fun. [https://github.com/dap-mux/dap-mux](dap-mux) is one of those.
+all of the fun. [dap-mux](https://github.com/dap-mux/dap-mux) is one of those.
 
 The observer only ever *joins* an existing multiplexer session. It does not spawn the adapter
 or manage the session.
@@ -17,15 +17,15 @@ or manage the session.
 ```sh
 # terminal 1 — adapter + mux
 python -m debugpy.adapter --host 127.0.0.1 --port 5678
-dap-mux --attach 5678 --headless -p 5679
+dap-mux --attach 5678 -p 5679
 
 # terminal 2 — Helix drives the session
 hx sieve.py    # set a breakpoint, then :debug-remote 127.0.0.1:5679 launch
 
 # terminal 3 — the observer (this crate)
-dap-observer                # connects to 127.0.0.1:5679 by default
-dap-observer 5680           # custom port
-dap-observer host:port      # custom host + port
+dap-tui                # connects to 127.0.0.1:5679 by default
+dap-tui 5680           # custom port
+dap-tui host:port      # custom host + port
 ```
 
 Step in the editor. The observer refreshes its variable tree whenever execution stops
@@ -46,11 +46,20 @@ scope stays pinned and shows `(unavailable)` until it resolves again.
 | --- | --- |
 | `j` / `k` (or ↓/↑) | move selection |
 | `l` / `h` (or →/←) | expand / collapse the selected node (fetches children lazily on expand) |
+| `K` / `J` | up or down a frame |
 | `Enter` / `Space` | toggle expand/collapse |
+| `i` | interactive mode. Evaluate expressions. |
+| `p` | pause |
+| `c` | continue |
+| `n` | next |
+| `s` | step into |
+| `o` | step over |
 | `w` | pin / unpin the selected variable as a watch |
 | `g` / `G` | jump to top / bottom |
 | `q` / `Esc` | quit (clean disconnect, terminal restored) |
 
-### Headless mode
+# dap-script
 
-`--headless` skips the TUI and prints each stop to stdout. Useful for testing.
+A DSL (Domain Specific Language) exposing the Debug Adapter Protocol to scripting. Repeatable bug
+explorations without learning gdb or lldb scripting. It works the same for anything that speaks DAP.
+More in its own [README](./crates/dap-script/README.md).

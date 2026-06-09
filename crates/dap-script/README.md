@@ -18,6 +18,9 @@ or to pass those steps on to someone else.
 - Debug a program and dumps its state to a json file to be used to create a fixture
 for use in testing.
 
+This is *NOT* a real scripting language. It is not intended to be Turing complete.
+It is a lightweight wrapper around the Debug Adapter Protocol command set.
+
 ## Running
 
     dap-script script.daps
